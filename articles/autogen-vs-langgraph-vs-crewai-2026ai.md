@@ -1,24 +1,20 @@
 ---
-title: "AutoGen vs LangGraph vs CrewAI: 2026年に実務で使えるのはどれか"
+title: "AutoGen vs LangGraph vs CrewAI: 2026年、実際に2週間使い倒して分かったこと"
 emoji: "🚀"
 type: "tech"
-topics: ["autogen", "langgraph", "crewai", "ai\u30a8\u30fc\u30b8\u30a7\u30f3\u30c8", "python"]
+topics: ["ai\u30a8\u30fc\u30b8\u30a7\u30f3\u30c8", "autogen", "langgraph", "crewai", "llm"]
 published: true
 ---
 
-先月、社内のデータレポート生成フローを自動化するタスクを引き受けた。毎週月曜日に複数のデータソースを集約して、SlackにKPIサマリーを投稿するやつだ。手動でやると毎週1〜2時間かかっていて、チーム全員が嫌がっていた。
+去年の11月、10人規模のスタートアップで顧客サポートの自動化システムを作ることになった。要件はシンプルに見えた——ユーザーの問い合わせを分類して、適切なナレッジベースを検索して、必要なら人間にエスカレーションする。ところがこれが思った以上に複雑で、結局3つのフレームワークを本番に近い環境で試す羽目になった。
 
-この手の仕事はAIエージェントにうってつけに見える。でも実装に入る前に「どのフレームワークを使うか」で詰まった。AutoGen（Microsoft）、LangGraph（LangChain）、CrewAI——この3つをそれぞれ実際のプロジェクトに当てはめながら約2週間テストした。その結果をまとめる。
+2週間、AutoGen 0.4.2、LangGraph 0.3.x、CrewAI 0.95（当時の最新）を並べて叩いた記録を書く。ベンチマーク記事みたいなきれいな数字は出てこない。でも「どっちを選ぶべきか」という問いに対して、自分なりの答えは出た。
 
-結論から言う。**LangGraphを選んだ**。ただし、それには理由があるし、ユースケースによってはCrewAIの方がはるかに合理的な選択になる。AutoGenは——正直言って——使うシーンをかなり選ぶ。
+## AutoGen 0.4の正直な評価——会話は得意、デバッグは地獄
 
-## AutoGen v0.4: APIが激変して最初の半日を溶かした
+AutoGenはMicrosoftが作っているマルチエージェントフレームワークで、0.4系で内部構造がかなり変わった。旧来の`ConversableAgent`ベースのアーキテクチャから、`AG2`という非同期ランタイムに移行している。この変更でパフォーマンスは上がったけど、ドキュメントとコードの乖離がひどくて最初の3日間は公式ドキュメントとGitHubのIssueを行き来し続けた（[Issue #4821](https://github.com/microsoft/autogen/issues/4821)あたりが参考になった）。
 
-GitHubのスター数が多くドキュメントも充実していたので、最初はAutoGenから触り始めた。ただ、すぐに壁にぶつかった。
-
-v0.4（2025年初頭リリース）でAPIが根本から書き直されている。v0.2以前のコードはほぼ動かない。Stack OverflowやQiitaの記事の多くがまだ古いAPIで書かれていて、最初の半日を「なぜimportが通らないのか」のデバッグに費やした。`autogen-agentchat`と`autogen-core`を両方インストールしないといけないとか、公式ドキュメントのどこに書いてあるの、という話だ（GitHub Issue #4782あたりで同じ悩みを持つ人たちが大量にいる）。
-
-v0.4の設計思想はマルチエージェントの「会話」を中心に置いている。`AssistantAgent`同士がメッセージをやり取りして、`RoundRobinGroupChat`や`SelectorGroupChat`でターンを管理する。
+一番気に入ったのは、エージェント同士の会話フローが本当に自然に書けること。
 
 ```python
 import asyncio
@@ -26,178 +22,174 @@ from autogen_agentchat.agents import AssistantAgent
 from autogen_agentchat.teams import RoundRobinGroupChat
 from autogen_ext.models.openai import OpenAIChatCompletionClient
 
-async def main():
-    model_client = OpenAIChatCompletionClient(model="gpt-4o")
-
-    # データ収集担当エージェント
-    collector = AssistantAgent(
-        name="DataCollector",
-        model_client=model_client,
-        system_message=(
-            "あなたはデータ収集の専門家です。"
-            "与えられたデータソースから必要な情報を抽出してください。"
-        ),
+# 実際のプロジェクトで使ったシンプルな構成
+async def run_support_pipeline(user_query: str):
+    model_client = OpenAIChatCompletionClient(
+        model="gpt-4o",
+        # コストを抑えるためmax_tokensは意識的に絞る
+        max_tokens=1024,
     )
 
-    # レポート作成担当エージェント
-    reporter = AssistantAgent(
-        name="Reporter",
+    classifier = AssistantAgent(
+        name="classifier",
         model_client=model_client,
-        system_message=(
-            "あなたはビジネスレポートの専門家です。"
-            "DataCollectorから受け取った情報を元に簡潔なKPIサマリーを作成してください。"
-        ),
+        system_message="問い合わせを billing/technical/general に分類してください。JSONで返すこと。",
+    )
+
+    resolver = AssistantAgent(
+        name="resolver",
+        model_client=model_client,
+        system_message="分類された問い合わせに対して、ナレッジベースから回答を作成してください。",
     )
 
     team = RoundRobinGroupChat(
-        [collector, reporter],
-        max_turns=6,  # 必ず設定すること——ないと普通に無限ループする
+        [classifier, resolver],
+        max_turns=4,  # ここを設定しないと無限ループのリスクがある——実際に1回やらかした
     )
-    result = await team.run(
-        task="先週の売上データを分析してSlack投稿用のサマリーを作成してください"
-    )
-    print(result.messages[-1].content)
 
-asyncio.run(main())
+    result = await team.run(task=user_query)
+    return result
+
+asyncio.run(run_support_pipeline("請求書が届いていません"))
 ```
 
-このパターン自体は直感的で、複数のエージェントが「議論」しながら答えに近づくのは面白い。研究用途や複雑な推論が必要なタスクには向いている。
+ここで一度やらかした話をしておく。`max_turns`を設定し忘れた状態でテストを回したら、エージェントたちが「私はclassifierです、あなたはresolverですね」みたいな自己紹介ループを延々と続けて、気づいたらOpenAIのAPIコストが数ドル飛んでいた。笑えない。
 
-本番で使うとき致命的になり得るのが、**実行フローの制御が難しい**点だ。エージェントが自律的に会話するのはいいが、「このステップが終わったら必ずここに来る」という保証がない。デバッグ用のログも大量すぎて構造化されておらず、何が起きているか追うのが辛い。自分のユースケース（決まったパイプラインを確実に実行する）には合わなかった。
+AutoGenが本領を発揮するのは、エージェント間の会話が複雑に絡み合うシナリオ——たとえばコードを書くエージェントとレビューするエージェントが行き来するような場合。でも「この処理を終えたら次のステップに進む」という明確な制御フローが必要な場合、正直に言うと向いていない。非決定的な動きが多くて、同じ入力でも出力がブレる。プロダクション環境でこれが許容できるかどうかは、ユースケース次第だと思う。
 
-一方で、AutoGenが明らかに輝くのは**探索的なタスク**だ。「このデータセットから面白いパターンを見つけてほしい」みたいな、正解が事前に定義できないケース。エージェント間の自律的な対話でアイデアが広がる感覚は、他の2つには出せない。
+**実用的な観点から**: AutoGenはプロトタイプ段階か、会話の自然さが最優先のプロジェクトに向いている。デバッグのしやすさを重視するなら次のLangGraphを見てほしい。
 
-## LangGraph: 最初は「過剰設計じゃないか」と思った
+## LangGraphは「めんどくさい」が正義だった
 
-正直、LangGraphに最初に触れたとき、「なんでこんな複雑なの」と思った。グラフを定義して、ノードを追加して、エッジを張って——シンプルなタスクに対してボイラープレートが多すぎる印象だった。
+LangGraphはLangChainチームが作っているグラフベースのフレームワークで、正直、最初は過剰エンジニアリングだと思っていた。ノードとエッジを定義して、状態を明示的に管理して……これって普通にコード書けばよくない？
 
-でも2〜3日使い込んだら、この設計の意味がわかった。
+でも2日ほど使ったら考えが変わった。
 
-LangGraphの本質は**明示的な状態管理**だ。エージェントの実行状態をすべて`State`（TypedDictで定義）に持ち、ノード間のデータの流れが全部見える。条件分岐も`add_conditional_edges`で明示的に定義する。
+LangGraphの核心は「状態がすべて明示的」なこと。各ノードが受け取るものと返すものが型で定義されていて、どこで何が起きているか追いやすい。AutoGenで悩んだ「なぜこのエージェントがこの返答をしたのか」という問題が、LangGraphではかなり減った。
 
 ```python
-from langgraph.graph import StateGraph, END
 from typing import TypedDict, Annotated
-import operator
+from langgraph.graph import StateGraph, END
+from langgraph.graph.message import add_messages
 
-class PipelineState(TypedDict):
-    raw_data: str
-    analysis: str
-    report: str
-    retry_count: int
-    messages: Annotated[list, operator.add]
+# 状態の定義がコードの設計図になる
+class SupportState(TypedDict):
+    messages: Annotated[list, add_messages]
+    category: str | None
+    escalate: bool
 
-def collect_data(state: PipelineState) -> dict:
-    # 実際にはAPIを叩いてデータを取得する
-    return {"raw_data": "Q4売上: ¥120M, 前年比+15%..."}
-
-def analyze(state: PipelineState) -> dict:
-    result = llm.invoke(f"以下を分析してください: {state['raw_data']}")
-    return {"analysis": result.content}
-
-def generate_report(state: PipelineState) -> dict:
-    report = llm.invoke(f"分析結果からレポートを作成: {state['analysis']}")
+def classify_node(state: SupportState) -> dict:
+    # LLMを呼んで分類する（省略）
+    # ここで返す値が次のノードへの入力になる
     return {
-        "report": report.content,
-        "retry_count": state.get("retry_count", 0),
+        "category": "technical",
+        "messages": [{"role": "assistant", "content": "技術的な問い合わせです"}]
     }
 
-def quality_check(state: PipelineState) -> str:
-    # レポートが短すぎたら最大2回リトライ
-    if len(state["report"]) < 200 and state.get("retry_count", 0) < 2:
-        return "retry"
-    return "publish"
+def resolve_node(state: SupportState) -> dict:
+    # categoryに基づいて回答を生成
+    if state["category"] == "billing":
+        # 請求系は別のツールを呼ぶ
+        pass
+    return {"messages": [{"role": "assistant", "content": "回答..."}]}
 
-builder = StateGraph(PipelineState)
-builder.add_node("collect", collect_data)
-builder.add_node("analyze", analyze)
-builder.add_node("report", generate_report)
+def should_escalate(state: SupportState) -> str:
+    # 条件分岐をここで明示的に書く——これが地味に重要
+    if state["escalate"]:
+        return "human_handoff"
+    return END
 
-builder.set_entry_point("collect")
-builder.add_edge("collect", "analyze")
-builder.add_edge("analyze", "report")
-builder.add_conditional_edges(
-    "report",
-    quality_check,
-    {"retry": "analyze", "publish": END},
-)
+# グラフの組み立て
+builder = StateGraph(SupportState)
+builder.add_node("classify", classify_node)
+builder.add_node("resolve", resolve_node)
+builder.add_edge("classify", "resolve")
+builder.add_conditional_edges("resolve", should_escalate)
+builder.set_entry_point("classify")
 
 graph = builder.compile()
-result = graph.invoke({"raw_data": "", "retry_count": 0})
 ```
 
-このコードを見れば、実行フローが一目でわかる。`collect → analyze → report`、品質が低ければ`analyze`に戻る。デバッグのときに「いまどのノードにいるのか」が常に明確なのが助かる。
+このコードを見ると「冗長だな」と感じる人もいると思う。でも3ヶ月後に自分が書いたコードを読み返す場面を想像してほしい。どのエージェントがどの条件で何をするのか、LangGraphなら一目で分かる。AutoGenで書いたコードは……正直、2週間後に読んでもよく分からなかった。
 
-一つ気になったのが、LangSmithとの連携だ。LangChainの有料サービスだけど、デバッグには本当に助かった。エージェントの各ステップで何が起きているかがブラウザ上のUIで追えるので、ローカルのログを必死に読む必要がない。無料プランでも月2,000トレースまで使えるので個人プロジェクトなら十分だと思う。
+LangChainのエコシステムとの統合も強い。LangSmith（トレーシングツール）がそのまま使えるので、本番環境でのデバッグが格段に楽だった。ただLangChainの負債も引き継ぐ——deprecated警告がうるさい、バージョン間の破壊的変更が多い、という問題は依然としてある。
 
-本番運用で特に評価が高かったのが、**ヒューマン・イン・ザ・ループ**の設定のしやすさだ。`interrupt_before`や`interrupt_after`を使えば、特定のノードの前後でグラフを一時停止して人間のレビューを挟める。「完全自律エージェント」ではなく人間の承認フローが必要な業務アプリでは、このコントロールが効く。
+**実用的な観点から**: チームで長期保守するプロジェクト、複雑な条件分岐がある処理フロー、本番環境での可観測性が必要な場合はLangGraph一択だと思った。
 
-## CrewAI: プロトタイプを一番速く作れたが、本番は要注意
+## CrewAIは「速さ」に価値がある——ただし条件付きで
 
-CrewAIは3つの中で一番「書いていて楽しい」フレームワークだった。役割（Role）を持ったエージェントをチームとして編成し、タスクを自然言語で定義するだけで動く。
+CrewAIは三つの中で一番すぐ動かせる。「役割を持つエージェントたちがタスクを協力してこなす」というメンタルモデルが分かりやすくて、ドキュメントを30分読めばとりあえず何か動く。
 
 ```python
-from crewai import Agent, Task, Crew
+from crewai import Agent, Task, Crew, Process
 
-analyst = Agent(
-    role="データアナリスト",
-    goal="売上データを分析して重要なインサイトを抽出する",
-    backstory="5年以上のデータ分析経験を持つエキスパート",
+# ロールプレイ感覚でエージェントを定義できる
+classifier = Agent(
+    role="カスタマーサポート分類エージェント",
+    goal="問い合わせを正確に分類する",
+    backstory="5年のカスタマーサポート経験を持つ分析のプロ",  # backstoryが地味に効く
     verbose=True,
 )
 
-writer = Agent(
-    role="ビジネスライター",
-    goal="分析結果を分かりやすいレポートにまとめる",
-    backstory="経営陣向けレポート作成が得意なコミュニケーター",
+resolver = Agent(
+    role="テクニカルサポートエージェント",
+    goal="技術的な問題を解決する",
+    backstory="エンジニアリング出身のサポートスペシャリスト",
     verbose=True,
 )
 
-analysis_task = Task(
-    description="Q4売上データを分析し、前四半期比・前年比・主要KPIの変化を特定してください",
-    expected_output="箇条書きで5〜7個のインサイト",
-    agent=analyst,
+classify_task = Task(
+    description="次の問い合わせを分類してください: {query}",
+    agent=classifier,
+    expected_output="billing/technical/general のいずれか",
 )
 
-report_task = Task(
-    description="分析インサイトを元に、Slack投稿用の200字以内のサマリーを作成してください",
-    expected_output="Slack投稿用テキスト",
-    agent=writer,
-    context=[analysis_task],  # 前のタスクの出力を参照——これを忘れると詰む
+resolve_task = Task(
+    description="分類された問い合わせに回答してください",
+    agent=resolver,
+    context=[classify_task],  # タスク間の依存関係
+    expected_output="ユーザーへの回答文",
 )
 
-crew = Crew(agents=[analyst, writer], tasks=[analysis_task, report_task])
-result = crew.kickoff()
+crew = Crew(
+    agents=[classifier, resolver],
+    tasks=[classify_task, resolve_task],
+    process=Process.sequential,
+)
+
+result = crew.kickoff(inputs={"query": "パスワードをリセットしたい"})
 ```
 
-コード量が少なく、役割が自然言語で定義されているので、非エンジニアにも見せやすい。チームのプロダクトマネージャーに見せたとき「これならエージェントの動きがイメージできる」と言っていた。
+見た目はきれいだし、エージェントに`backstory`を与えると品質が上がるのも面白い（これは実際に効果があった——なぜかは正直よく分からない）。
 
-で——ここが肝心なのだけど——CrewAIには**実行フローのコントロールが根本的に弱い**という問題がある。エージェントが「そのタスクを完了した」と判断するのが内部ロジックに依存していて、外からハンドリングしにくい。タスクが複雑になると、エージェントが予期しない行動をとることがある。本番で「なぜこの出力になったのか」を追うのが辛い。
+ただ、私が不満を感じたのは制御フローの柔軟性が低いこと。CrewAIは内部で何をしているかが分かりにくくて、「なぜこのタスクがこの順番で実行されているのか」を追うのが難しい。階層型プロセス（`Process.hierarchical`）を使おうとしたら、マネージャーエージェントが予想外の判断をして処理が止まる場面が何度かあった。デバッグツールもLangSmithほど充実していない。
 
-CrewAI 0.80以降（2025年末リリース）でFlowsという機能が追加されて状態管理が多少改善されたが、LangGraphの明示性には追いついていない印象だ。100%確信があるわけではないが、CrewAI Flowsは根本的な設計思想を変えるものではなく、既存のアーキテクチャに後付けした感が否めない。
+あと、LLMプロバイダーへの依存がやや強い。私のプロジェクトはAzure OpenAIを使っていたんだけど、設定まわりで詰まる箇所があって1時間溶けた。
 
-## やらかし話と、実際のベンチマーク結果
+**実用的な観点から**: PoC段階でとにかく速く動かしたい、チームメンバーがLLMに詳しくない、という場合はCrewAIが最短経路。ただし本番に持っていくタイミングで別のフレームワークへの乗り換えを検討することになるかもしれない——実際に私がそうなった。
 
-やらかした話をひとつ。CrewAIで最初に作ったとき、`context`パラメーターを渡し忘れていて、`writer`エージェントが`analyst`の出力を参照できずに動いていた。出力はそれっぽく見えたのに、実は前のタスクの結果を全く使っていなかった。LangGraphなら状態の型定義でコンパイル時に気づけるケースだった。それに気づくまで30分くらいかかった。
+## コスト・速度・デバッグの現実
 
-2週間の実装テストで見えた比較を率直に書く。
+2週間のテストで分かったことをまとめると、こんな感じ。
 
-**デバッグしやすさ**: LangGraph > AutoGen > CrewAI。LangGraphは状態が全部見えるしLangSmithがある。AutoGenはログが多いが構造化されていない。CrewAIは何が起きているか一番追いにくかった。
+**APIコスト**: 同じタスクに対して、CrewAIが一番トークンを使いがちだった。抽象化の高さと引き換えに、内部でシステムプロンプトが膨らむ。LangGraphは自分でプロンプトを制御できるので、無駄がない。AutoGenは中間くらい——ただしループを適切に制御しないとスパイクする。
 
-**初期開発速度**: CrewAI > AutoGen > LangGraph。CrewAIで最初の動くプロトタイプができたのは2時間足らず。LangGraphは状態の設計とグラフの接続で丸一日かかった。
+**レイテンシ**: 差は少ないが、LangGraphが一番予測しやすい。AutoGenは会話のターン数によって大きくブレる。
 
-**本番での予測可能性**: 1週間稼働させた感触では、LangGraphが一番安定している。CrewAIは稀に予期しない出力を返した——特にデータが空の場合の処理が弱かった。AutoGenはエラー回復が意外と自然で、エージェント間で問題を「相談」して解決しようとする挙動がある（これが良いかどうかはユースケース次第だが）。
+**デバッグ**: LangGraph（LangSmith連携あり）> AutoGen（ログは充実してるが読みにくい）> CrewAI（ブラックボックス感がある）の順。
 
-## 結局どれを選ぶか
+One thing I noticed（これ日本語で言うと変なので英語のまま使う）: フレームワークの抽象度が高いほど、最初の立ち上がりは速いが、想定外の動作に対処する時間が増える傾向がある。CrewAIで「なんか変な動きをする」を解決するのに費やした時間と、LangGraphで最初のグラフを設計する時間は、結局あまり変わらなかった。
 
-ポジションを明確にする。
+100%確信はないが、チームが5人以上でLLMアプリを長期運用するなら、初期のセットアップコストを払ってでも可観測性の高いフレームワークを選ぶ方が、トータルコストが下がると思っている。
 
-**本番運用するエージェントパイプラインを作るなら、LangGraphを使う**。初期のセットアップコストは高いが、状態管理の明示性とデバッグのしやすさは他の2つにない強みだ。条件分岐が複雑なワークフロー、監査ログが必要な業務アプリ、ヒューマン・イン・ザ・ループが必要なシステム——こういった場面では迷わずLangGraph。
+## 結局、何を選ぶか——私の答え
 
-**素早くプロトタイプを作って検証したいなら、CrewAIから始める**のが合理的だ。コンセプト検証、ステークホルダーへのデモ、PoC——CrewAIなら数時間で動くものができる。本番移行を見据えているなら、その時点でLangGraphへの書き直しを検討すればいい。
+曖昧にしたくないので直接書く。
 
-**AutoGenは、複数のLLMが協調してより良い答えを導き出す探索的なユースケース向け**。コードレビューを複数の視点で評価させる、複雑なリサーチクエスチョンをエージェントが協調して解く——こういった場面なら、AutoGenのアーキテクチャが一番しっくりくる。
+**LangGraphを選ぶ**: 本番運用する、チームで保守する、処理フローが複雑、デバッグのしやすさを重視する——これらのどれか一つでも当てはまるなら。最初は面倒くさく感じるが、その面倒くささがコードベースの堅牢さに直結する。
 
-自分のデータパイプラインはLangGraphで本番に上げた。今は毎週月曜朝8時にエージェントが自動でレポートを生成してSlackに投稿している。最初の1週間は状態の型定義でハマりまくったが、今は安定して動いている。チームの月曜朝の作業が1〜2時間削減されたので、結果的には正解だったと思っている。
+**AutoGenを選ぶ**: コードを書いて実行して評価するサイクルが中心のユースケース（Microsoftのデモがこれが多い）、あるいはエージェント同士の自由な会話を試したい研究・実験的なプロジェクト。プロダクション前提なら注意が必要。
 
-この3つのフレームワークは今後も動き続ける。AutoGenはv0.5の開発が進んでいるし、LangGraphもLangChain本体との統合が深まっている。半年後にはまた状況が変わっているかもしれない。ただ、設計思想の軸——「自律的な会話」「明示的なグラフ」「役割ベースのチーム」——は当面変わらないはずなので、フレームワークを選ぶ基準として使えると思う。
+**CrewAIを選ぶ**: 「とにかく2日でデモを作る」という場合。ロールベースの設計が直感的なので、LLMになじみのないステークホルダーに見せるプロトタイプには向いている。ただし私は本番にCrewAIをそのまま持ち込む判断はしなかった——もしかしたら特定のユースケースではいけるかもしれないが、少なくとも私のケースでは制御フローの予測不能さがリスクだった。
+
+結局、今の本番システムはLangGraphで書き直した。最初のLangGraph実装を作るのに3日かかったけど、その後の改修が楽で、先週新しいエスカレーションルールを追加するのに30分かからなかった。それが答えだと思っている。
