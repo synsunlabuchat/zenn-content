@@ -1,168 +1,183 @@
 ---
-title: "プロダクションAIパイプライン: 1万5千回の実行から学んだこと"
+title: "プロダクションAIパイプライン構築: 1万回以上の実行から学んだ教訓"
 emoji: "🚀"
 type: "tech"
-topics: ["ai", "llm", "pipeline", "production", "openai"]
+topics: ["ai", "llm", "python", "openai", "\u30d7\u30ed\u30c0\u30af\u30b7\u30e7\u30f3"]
 published: true
 ---
 
-去年の11月、深夜2時にSlackの通知で目が覚めた。コンテンツ分類パイプラインが6時間動き続けて、OpenAI APIの費用を$340溶かしていた。結果物の約70%はゴミだった。原因はリトライロジックのバグ——なぜリクエストが失敗しているかを区別できていなかった。`context_length_exceeded`エラーが出るたびに問答無用で3回リトライしていた。朝には手遅れだった。
+去年の11月、Slackに通知が飛んできた。「ドキュメント要約パイプラインが2時間止まってる」。確認してみると、ログはほぼ空。エラーも出ていない。ただ静かに、何も処理されていなかった。
 
-あの夜から、AIパイプラインを「ちょっとした配管付きAPIコール」として扱うのをやめた。そこから1万5千回以上の処理をこなしてきた——ドキュメント分類、コードレビュー自動化、12人のエンジニアチーム向け社内Q&Aシステム。実際に何が壊れるか、かなり具体的な意見を持てるようになった。
+原因を追うのに3時間かかった。OpenAIのレート制限に静かに引っかかっていて、リトライロジックが事実上の無限ループに近い状態になっていた。コストもその間ずっと積み上がっていた。
 
-## リトライロジックは一律じゃ絶対ダメ
+あの日以来、私はAIパイプラインの「なんとなく動いてる」という感覚を一切信用しなくなった。
 
-最初に実装したのはシンプルなものだった。`tenacity`を使って指数バックオフを設定して、「はい、できた」と思っていた。
+## ログを入れるまで、何も見えていなかった
 
-```python
-from tenacity import retry, stop_after_attempt, wait_exponential
+最初の3ヶ月、私たちのパイプラインはほぼブラックボックスだった。入力を投げて、出力が返ってくる。それだけ。でも1日あたり数百回の実行が数千回になったとき、「なんか遅い」「たまに変な出力が出る」という報告が増え始めた。
 
-@retry(
-    stop=stop_after_attempt(3),
-    wait=wait_exponential(multiplier=1, min=4, max=60)
-)
-def call_llm(prompt: str) -> str:
-    response = client.chat.completions.create(
-        model="gpt-4o",
-        messages=[{"role": "user", "content": prompt}]
-    )
-    return response.choices[0].message.content
-```
+再現できない。ログがないから。
 
-技術的には間違っていない。問題は、これが危険なくらい不完全だということだ。OpenAIのエラーを全部同じように扱ってはいけない。それがまさに$340を一晩で溶かす原因になる。
+LangSmith（0.1系が出た頃）を入れてみて、初めて実際の挙動が見えた。特定のドキュメントタイプでプロンプトのトークン数が跳ね上がっていること、リトライが発生しているのに成功扱いになっているケースがあること、レスポンスタイムの分布が思っていたより二峰性だったこと——全部、ちゃんとしたトレーシングを入れて初めてわかった。
 
-`RateLimitError`はリトライすべき。レートを超えた、少し待てばいい。でも`InvalidRequestError`は？リトライしても意味がない。プロンプトがコンテキスト長を超えているか、不正なパラメータを渡しているかのどちらかだ。2回目も同じ理由で失敗する。あの深夜2時のインシデントは正確にこれだった——`context_length_exceeded`エラーが繰り返しキューに入り、毎回トークン代を課金されながら失敗し続けた。
+正直、LangSmithは私の環境（小さなスタートアップ、エンジニア5人）ではコストがネックになってきたので、今は[Langfuse](https://langfuse.com)をセルフホストしている。機能的にはLangSmithとほぼ同等で、データが手元に置けるのも安心感がある。ただセルフホストのメンテコストは無視できないので、チームの状況次第だと思う。
 
-ちゃんと分類するとこうなる:
+ここが重要なんだが: LLMの呼び出しを単なるAPIコールとして扱わないこと。入力トークン数、出力トークン数、レイテンシ、モデルのバージョン、`finish_reason`——これを全部記録する。「後でいいや」と思うかもしれないが、デバッグで絶対後悔する。
 
-- **リトライあり**: `RateLimitError`、`APITimeoutError`、`APIConnectionError`、`InternalServerError`（503）
-- **リトライなし**: `InvalidRequestError`、`AuthenticationError`、`PermissionDeniedError`
-- **内容を見てから判断**: `BadRequestError` — エラーメッセージを確認して決める
-
-実際に使っているコードはこれ:
+実際に私が入れているのはこういうラッパーだ:
 
 ```python
-import openai
-from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_type
+import time
+import logging
+from openai import OpenAI, RateLimitError, APITimeoutError, BadRequestError
+from dataclasses import dataclass
+from typing import Optional
 
-RETRYABLE_EXCEPTIONS = (
-    openai.RateLimitError,
-    openai.APITimeoutError,
-    openai.APIConnectionError,
-    openai.InternalServerError,
-)
+logger = logging.getLogger(__name__)
+client = OpenAI()
 
-@retry(
-    retry=retry_if_exception_type(RETRYABLE_EXCEPTIONS),
-    stop=stop_after_attempt(4),
-    wait=wait_exponential(multiplier=2, min=5, max=120),
-    reraise=True
-)
-def call_llm(prompt: str, model: str = "gpt-4o-mini") -> str:
-    try:
-        response = client.chat.completions.create(
-            model=model,
-            messages=[{"role": "user", "content": prompt}],
-            timeout=30.0  # これを省くと無限に待つ羽目になる
-        )
-        return response.choices[0].message.content
-    except openai.BadRequestError as e:
-        # context_length_exceededはリトライ不可——即座に諦める
-        if "context_length_exceeded" in str(e):
-            raise ValueError(f"プロンプトが長すぎます: {len(prompt)} chars") from e
-        raise
+@dataclass
+class LLMResult:
+    content: str
+    input_tokens: int
+    output_tokens: int
+    latency_ms: float
+    finish_reason: str
+    model: str  # 実際に使われたモデルを記録（自動フォールバックがある場合に重要）
+
+def call_with_observability(
+    messages: list,
+    model: str = "gpt-4o",
+    max_retries: int = 3,
+    request_id: Optional[str] = None,
+) -> LLMResult:
+    """
+    エラータイプを区別しながらリトライ。
+    RateLimitとTimeoutは再試行、BadRequest（コンテンツポリシー等）は即座に失敗させる。
+    """
+    attempt = 0
+    while attempt < max_retries:
+        start = time.monotonic()
+        try:
+            response = client.chat.completions.create(model=model, messages=messages)
+            latency_ms = (time.monotonic() - start) * 1000
+
+            result = LLMResult(
+                content=response.choices[0].message.content,
+                input_tokens=response.usage.prompt_tokens,
+                output_tokens=response.usage.completion_tokens,
+                latency_ms=latency_ms,
+                finish_reason=response.choices[0].finish_reason,
+                model=response.model,
+            )
+            _log_to_trace(request_id, result, messages)  # 自前のトレーシングに送る
+            return result
+
+        except RateLimitError as e:
+            wait = 2 ** attempt  # 指数バックオフ
+            logger.warning(f"RateLimit hit (attempt {attempt+1}), waiting {wait}s")
+            time.sleep(wait)
+            attempt += 1
+
+        except APITimeoutError:
+            logger.warning(f"Timeout (attempt {attempt+1})")
+            attempt += 1
+
+        except BadRequestError as e:
+            # コンテンツポリシー違反などはリトライしても無駄——即座に上位に投げる
+            logger.error(f"BadRequest — リトライ不可: {e}", extra={"request_id": request_id})
+            raise
+
+    raise RuntimeError(f"LLM call failed after {max_retries} attempts")
 ```
 
-`timeout=30.0`は省略禁止だ。OpenAI APIはたまに——特に閑散時間帯に——90秒以上無音になることがある。タイムアウトなしだとワーカーがそこで詰まって、バッチジョブが数分ではなく数時間止まる。実際にそれで何時間も無駄にしたことがある。
+ポイントは`finish_reason`を見ること。`length`で終わっていたら出力が切り捨てられている——これに気づかず「AIの出力がおかしい」と半日悩んだことがある。`stop`以外が返ってきたら、それは正常ではない。
 
-リトライの上限を4回にしているのも理由がある。それ以上は大抵、一時的な問題じゃなく構造的な問題を踏んでいる。リトライを増やしてもレイテンシが伸びるだけで何も解決しない。
+## LLM特有の失敗パターンは、普通のAPIと全然違う
 
-## コストが予想外に膨らむ3つのポイント
+Webアプリを8年作ってきて、API障害への対処には慣れていたつもりだった。でもLLMは別物だと痛感した。
 
-正直に言う。「トークンをちょっと使うくらいでしょ」と実際に声に出して言っていた。2ヶ月後にそれを言うのをやめた。
+普通のAPIなら「500が返ったらリトライ」でだいたい済む。LLMの場合、エラーの種類によって対処が根本的に違う:
 
-**システムプロンプトの重複。** 同じパイプラインで100件のドキュメントを処理するとき、システムプロンプトが500トークンなら、それが100回送られる。OpenAIのPrompt Caching（2024年8月から利用可能）を使えば、キャッシュされた入力トークンが90%割引になる——gpt-4oの場合。ただし1024トークン以上のプレフィックスじゃないとキャッシュが発動しない。短いシステムプロンプトは恩恵がない。安定したコンテンツを先頭に、動的なドキュメントごとのコンテンツをその後に配置する構造にすること。
+- **レート制限**: 待てば治る。指数バックオフで十分。
+- **タイムアウト**: 長いプロンプトやサーバー混雑が原因。リトライしていいが回数に上限を。
+- **コンテンツポリシー違反**: 入力に問題がある。何度リトライしても同じ。即座に失敗させてログに残す。
+- **コンテキスト長超過**: プロンプトが長すぎる。呼び出す前にトークン数を`tiktoken`でバリデーションする。
 
-**モデルの選び方。** デフォルトでgpt-4oを全部の処理に使っていた。プロトタイプで使い慣れていたし、「安全牌」という気持ちがあった。50件のドキュメントで両モデルの出力を手動比較したA/Bテストをやってみたら——単純な分類タスクで、gpt-4o-miniはgpt-4oと精度差が3〜5%に収まりながら、コストは約15〜20分の1だった。分類とキーワード抽出をminiに移し、複雑な推論や長文要約をgpt-4oに残した。その一変更だけで月のコストが約60%減った。
+で、これを区別しないと何が起きるか。コンテンツポリシー違反でリトライを3回繰り返し、3回分のコストを無駄に払う。実際にやった（後述する）。
 
-ただし「単純なタスク」かどうかは自分で検証すること。何が単純に当たるかはタスクによってかなり違う。
+もう一つ厄介なのが、エラーではなく「壊れた成功」だ。`finish_reason: "content_filter"`が返ってきているのに、`choices[0].message.content`が`None`になっているケースがある。これを正常レスポンスとして処理してしまうと、`None`がひっそりとデータベースに積み上がっていく。明示的なチェックを必ず入れること。
 
-**出力トークンを制限していない。** gpt-4o-miniでは出力トークンのコストが入力の約4倍。構造化JSONを期待しているのに`max_tokens`を設定しないと、モデルが必要以上に長く応答することがある。`response_format={"type": "json_object"}`を使えば出力は一貫して短くなるが——モデルがスキーマの隙をついて冗長な`reasoning`フィールドを追加することがある。スキーマはできるだけ厳密に定義すること。`max_tokens`の上限設定は安価な保険だ。
+## レート制限とコストで壁に当たった話
 
-## モデルの出力をそのまま信じるな
+去年の夏、ユーザーが増えてパイプラインの実行回数が1日3000回を超えたあたりから、OpenAIのTPM（tokens-per-minute）制限に定期的に引っかかるようになった。
 
-LLMが幻覚することは知っていた。でもその幻覚した出力が気づく前にデータベースを汚染できる、という事実には十分に対処できていなかった。
+最初の対策は単純なリトライで、これである程度は解消した。でも根本的な問題は残っていた——同時実行数を制御していなかった。
 
-うちのパイプラインで起きた事故はこうだ。5つの特定カテゴリ名のひとつでドキュメントを分類するタスクで、モデルが時々微妙に違うカテゴリ名を返していた——類義語だったり大文字・小文字が違ったり、たまに完全に存在しない名前だったり。発生頻度が低かったので手動のスポットチェックでは表面化しなかった。それから下流システムでエラーが出始めて、追跡したら、不正なカテゴリがDBに保存されていた。データのクリーニングに半日かかった。
+asyncioで並列実行しているとき、同時に50リクエスト投げれば当然レート制限に引っかかる。`asyncio.Semaphore`で同時実行数を8に絞ったら、スループットはほぼ変わらずにエラーが激減した。この数字は環境によるので、自分のTierの制限値と照らし合わせて調整してほしい。
 
-Pydanticで適切に定義されたenumを使うのが一番シンプルな解決策だった:
+コスト面で効いたのはキャッシュだった。私たちのユースケースでは、同一ドキュメントを異なるユーザーが要求することが少なくなかった。入力のハッシュをキーにしてRedisに結果をキャッシュしたところ、月のAPIコストが約30%下がった。
+
+ただ、キャッシュには落とし穴がある。プロンプトのバージョンが変わったときにキャッシュを無効化しないと、古いバージョンの出力を返し続ける。キャッシュキーにプロンプトのバージョンハッシュを含めることで解決したが、これに気づくまで「プロンプトを直したはずなのに挙動が変わらない」と1週間近く悩んだ。
+
+## プロンプトをコードとして扱う、という当たり前の話
+
+**やらかした話をする。**
+
+プロンプトをコードベースにべた書きしていた時期、ある「小さな改善」をプロダクションに直接デプロイした。出力フォーマットのインストラクションを少し変えただけのつもりが、下流パーサーが期待するJSONの構造が微妙に変わってしまい、数百件のレコードが壊れたフォーマットで保存された。
+
+バックフィルに2日かかった。コンテンツポリシー違反でリトライを繰り返していたのもこの時期で、なかなかしんどい週だった。
+
+それ以来、プロンプトの管理方針を完全に変えた:
 
 ```python
-from pydantic import BaseModel, field_validator
-from enum import Enum
-import json
+# prompts/v2/document_summary.py
 
-class Category(str, Enum):
-    TECHNICAL = "technical"
-    BUSINESS = "business"
-    LEGAL = "legal"
-    MARKETING = "marketing"
-    OTHER = "other"
+PROMPT_VERSION = "v2.1.0"
 
-class ClassificationResult(BaseModel):
-    category: Category
-    confidence: float
-    reasoning: str
+SYSTEM_PROMPT = """あなたは技術文書の要約専門家です。
+以下のルールに従って要約してください:
+- 必ずJSON形式で返す
+- "summary"キーに日本語の要約（200字以内）
+- "key_points"キーにリスト形式の要点（3〜5個）
+- "confidence"キーに要約の確信度（0.0〜1.0）
+"""
 
-    @field_validator("confidence")
-    @classmethod
-    def confidence_range(cls, v: float) -> float:
-        if not 0.0 <= v <= 1.0:
-            raise ValueError("confidence must be between 0 and 1")
-        return v
+def build_prompt(document: str) -> list[dict]:
+    return [
+        {"role": "system", "content": SYSTEM_PROMPT},
+        {"role": "user", "content": f"以下の文書を要約してください:\n\n{document}"},
+    ]
 
-def classify_document(text: str) -> ClassificationResult:
-    response = call_llm(
-        f"以下のドキュメントを分類してください。JSONのみで回答してください。\n\n{text}"
-    )
-    try:
-        data = json.loads(response)
-        return ClassificationResult(**data)
-    except (json.JSONDecodeError, ValueError) as e:
-        # パース失敗を専用メトリクスとして追跡する
-        metrics.increment("llm.output_parse_failure")
-        logger.error(f"出力パース失敗: {e}, 生データ: {response[:200]}")
-        raise OutputValidationError("モデル出力が期待するスキーマと一致しません") from e
+# キャッシュキーやトレーシングに使う
+METADATA = {
+    "version": PROMPT_VERSION,
+    "model": "gpt-4o",
+    "created": "2026-02-10",
+    "changelog": "confidence fieldを追加、key_pointsの数を3〜5に変更",
+}
 ```
 
-One thing I noticed: パース失敗を専用メトリクスとして追跡することが、思ったより役に立つ。その割合が予想外に上がったとき、プロンプトが変わったか、モデルの挙動が静かに変化したかのどちらかだ。OpenAIはモデルを常にアナウンスせずに更新している——パース失敗率を監視することで、gpt-4o-miniの静かな挙動変化を2回キャッチした。1回は2024年末頃、構造化出力がやや冗長になってJSONの前にラッパーテキストを追加し始めたときだった。
+プロンプトをファイルとして管理し、バージョンをセマンティックバージョニングで追う。変更はPRで行い、キャッシュキーにもバージョンを含める。「プロンプトを変えた」という事実がgit logに残るので、何か壊れたときに「あの変更以降だな」とすぐ特定できる。
 
-`confidence`フィールドも活きている。0.5未満の結果は自動処理せず手動レビューキューに送っている。モデルが報告するconfidenceが実際の精度とどれだけ一致するかは議論の余地があるが——自分の経験だとあくまで大まかな指標で、キャリブレートされた確率としては信頼できない——それでも不確かなケースを仕分けるのには役立つ。
+LangfuseやPromptLayerのようなプロンプト管理ツールも試したが、私のチームには少しオーバーエンジニアリングだった。シンプルにファイル管理 + gitで、今のところ十分に機能している。チームが大きくなったら再検討するかもしれない。
 
-## 可観測性：一番軽視していた部分
+いいか、A/Bテストをどうするかという問題もある。今のところ、ユーザーIDのハッシュで振り分けて、下流タスクの成功率で評価している。自動評価はまだうまく機能しておらず、最終的には人間のレビューが必要なケースが多い——ここは正直、100%解決できているとは言えない。
 
-これがこのリストで最も過小評価されているセクションだ。普通のAPIサービスなら計測は比較的シンプルだ——リクエストログ、エラー率、レイテンシ。AIパイプラインはそれに加えて新しい問題が乗っかってくる——非決定的な出力、リクエストごとにばらつくトークンベースのコスト、サイレントなモデル変更、特定の入力タイプにだけ現れる失敗モード。
+## 結局、私が実際に使っている構成
 
-リクエスト単位で追跡しているのはこれ: 入力トークン数、出力トークン数、レイテンシ、モデル名、成功/失敗、リトライ回数、パース成功/失敗、APIレスポンスの`usage`フィールドから計算した推定コスト。最後のものが特に重要だ。コスト配分をOpenAIのダッシュボードに任せてはいけない——リクエスト単位のデータがあって初めて、どのパイプラインステージや入力タイプが高いかわかる。「今月AIコストが40%上がった」だけでは何も解決できない。
+1万回以上の実行を経た今のスタックはこうなっている。
 
-メトリクスとは別に、ランダムサンプリングもやっている。完了したリクエストの1〜2%を人間がチェックする。その人間は自分で、大抵金曜の朝に30分。自動化された検証ではなく——入力と出力を実際に目で見て、それらが筋が通るかどうか確認する。面倒だ。でもこの習慣がプロンプトのデグレードを本番インシデントになる前に2回捕まえてくれた。自動メトリクスは「何かがおかしい」ことを教えてくれる。サンプリングは「何が」「なぜ」おかしいかを教えてくれる。
+**オーケストレーション**: LangChainは最初入れたが、バージョン間の破壊的変更に何度も踏まされて（0.1から0.2の移行が特につらかった）、今は薄いラッパーを自作している。チェーンが複雑になるとデバッグも難しくなる。ただ、シンプルなユースケースには今でも悪くないと思う。
 
-LangSmithは数週間試した。複数のブランチを持つ複雑なチェーンやマルチステップのエージェントループのデバッグには本当に有用だ。うちのパイプラインはそうじゃない——ほぼ線形だ——ので、オーバーヘッドに見合う効果がなかった。今はOpenTelemetryでGrafanaにトレースを送っている。初期設定は多いが、計測が透明でベンダーロックインもない。
+**可観測性**: Langfuseをセルフホスト（Docker Compose）。コスト的にLangSmithより現実的だった。
 
-告白すると——最初の3ヶ月間、可観測性をまともに作っていなかった。「とりあえず動かして後から追加しよう」という考えだったが、後から追加する方が最初から作るより何倍もしんどかった。特にレイテンシ分析とコスト追跡は、初期設計に含まれていないと後付けがかなり難しい。可観測性を後回しにした代償は、「後付けする工数」だけじゃない。早めに気づけたはずのインシデントのコストも含まれる。先に作れ、たとえ時期尚早に感じても。
+**エラーハンドリング**: エラータイプごとに明示的に分岐。リトライは`tenacity`ライブラリが便利——自前で書くと細かいバグが出る。
 
-## 今から作り直すなら、こうする
+**コスト管理**: 月次でモデル別・ユースケース別のコストを集計し、予算超過アラートをSlackに流している。毎月見ると、思わぬ箇所でトークンを食っていることがよくある。
 
-曖昧な「場合による」は言わない。ゼロから始めるなら実際こうする。
+**プロンプト管理**: Gitで管理、セマンティックバージョニング、キャッシュキーにバージョンハッシュを含める。
 
-**SDKを直接使う。** パイプラインがLLMコールの連続と前後処理なら、LangChainは使わない。抽象化レイヤーがデバッグを難しくするし、メジャーバージョンアップのたびに何かが壊れる（langchain 0.2 → 0.3の移行は辛かった）。LangChainが効果を発揮するのは複雑なエージェントループやマルチステップRAGシステムのとき。絞られた本番パイプラインに対しては、不要な複雑さでしかない。
+これが全員に合う構成だとは思わない。でも「なんとなく動いてる気がする」から「ちゃんと動いていることが確認できる」状態に移行したことで、夜中に叩き起こされる回数は明らかに減った。
 
-**リトライ可能なエラーとそうでないエラーを最初から分けること。** リトライ回数、最終結果、具体的な失敗理由をログに残す。深夜11時にデバッグするとき、それを自分に感謝することになる。
-
-**リクエスト単位のコスト追跡を最初から入れること。** OpenAIのダッシュボードに一日あたりの支出アラートも設定する——自分は$50/日に設定している。これが2回発動した。両方ともバグが原因で、正当な負荷ではなかった。
-
-**新しいプロンプトとモデル変更はカナリアデプロイすること。** トラフィックの10%を新バージョンに流して数時間メトリクスを見てから全体に展開する。新しいモデルが特定のタスクで必ずしも良い結果を出すとは限らない。gpt-4oのアップデート後に分類出力のノイズが増えて、以前のバージョンにロールバックしたことが2回ある。
-
-**Pydanticで出力を検証すること。** モデルが指示に従うのが上手いからじゃない——実際かなり上手い——だが「かなり上手い」では、月15,000リクエストで1%の失敗率が150件の破損レコードを意味する場合には不十分だ。それは許容できない。
-
-100%自信があるとは言えない——特にキューイングや並行管理周りは、10倍の負荷になったら設計を見直す必要があるだろう。でも、社内AIパイプラインを本番で動かし始めてちょっとガタが来てきた感じがあるなら、これは6ヶ月前に誰かに渡しておいてほしかったチェックリストだ。深夜2時のアラートは防げる。大抵は、そう。
+一つだけ言えること: 可観測性は後回しにしない。最初の100回の実行からログを取れ。そうしないと、1万回目にやっと問題に気づくことになる。
